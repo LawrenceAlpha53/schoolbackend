@@ -1,0 +1,41 @@
+'use strict';
+
+const { Model } = require('sequelize');
+
+module.exports = (sequelize, DataTypes) => {
+
+  class Teacher extends Model {}
+
+
+  Teacher.associate = (models) => {
+
+  Teacher.belongsTo(models.Class, {
+    foreignKey: 'classId',
+    as: 'class'
+  });
+
+  Teacher.belongsTo(models.Subject, {
+    foreignKey: 'subjectId',
+    as: 'subject'
+  });
+
+};
+
+  Teacher.init({
+
+    fullName: DataTypes.STRING,
+    email: DataTypes.STRING,
+    phoneNumber: DataTypes.STRING,
+    subjectId: DataTypes.INTEGER,
+    classId: DataTypes.INTEGER
+
+  }, {
+
+    sequelize,
+    modelName: 'Teacher',
+    tableName: 'Teachers'
+
+  });
+
+  return Teacher;
+};

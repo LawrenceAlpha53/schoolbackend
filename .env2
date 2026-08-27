@@ -1,0 +1,27 @@
+Primary key
+a055f0d40eac4a578204d11dd33dacfe
+
+
+Secondary key
+f156d48c324f4a2095b00a5aab71f919'
+
+
+
+
+
+
+
+
+HTTP response
+HTTP/1.1 201 Created
+
+content-length: 45
+content-type: application/json;charset=utf-8
+date: Wed, 05 Aug 2026 16:38:34 GMT
+strict-transport-security: max-age=31536000; includeSubDomains
+vary: Origin
+x-xss-protection: 1; mode=block
+
+{
+    "apiKey": "9909549697504a3eaeb8c6b81a291293"
+}

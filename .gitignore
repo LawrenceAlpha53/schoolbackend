@@ -1,0 +1,68 @@
+# .gitignore
+node_modules/
+.env
+.env.local
+.env.*.local
+.DS_Store
+dist/
+build/
+*.log
+
+
+
+
+
+
+
+
+# Environment variables / secrets
+
+
+.env.development
+.env.production
+.env.test
+
+# Logs
+logs/
+
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Runtime files
+*.pid
+*.seed
+*.pid.lock
+
+# Coverage
+coverage/
+.nyc_output/
+
+
+
+# Temporary files
+tmp/
+temp/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor files
+.vscode/
+.idea/
+
+# Sequelize
+# Do NOT ignore migrations or seeders
+# migrations/       <-- KEEP
+# seeders/          <-- KEEP
+
+# Local database files, if any
+*.sqlite
+*.sqlite3
+*.db
+
+# Uploaded files generated locally
+uploads/*
+!uploads/.gitkeep

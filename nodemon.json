@@ -1,0 +1,13 @@
+{
+  "watch": [
+    "index.js",
+    "UserControllers",
+    "UserServices",
+    "UserRoute",
+    "Config"
+  ],
+  "ext": "js,json",
+  "ignore": ["node_modules"],
+  "exec": "node index.js",
+  "delay": 100
+}
