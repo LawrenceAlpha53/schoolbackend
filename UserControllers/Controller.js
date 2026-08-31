@@ -164,9 +164,15 @@ module.exports = {
 
 async login(req, res) {
   try {
-    const { Email, password } = req.body;
+    // Accept either "Email" or "email" from the request body — some clients
+    // (older frontend builds, other tools hitting this endpoint, etc.) send
+    // lowercase "email". Trimming also stops whitespace-only values from
+    // slipping past the falsy check below.
+    const rawEmail = req.body.Email ?? req.body.email;
+    const Email = typeof rawEmail === 'string' ? rawEmail.trim() : rawEmail;
+    const password = req.body.password; // keep as-is: don't mutate the actual password
 
-    if (!Email || !password) {
+    if (!Email || !password || (typeof password === 'string' && password.trim() === '')) {
       return res.status(400).json({
         success: false,
         message: "Email and password are required"
