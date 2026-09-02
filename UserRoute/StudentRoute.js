@@ -55,304 +55,268 @@ router.get('/:id', verifyToken, StudentController.getStudent);
 router.put('/:id', verifyToken, StudentController.updateStudent);
 router.delete('/:id', verifyToken, StudentController.deleteStudent);
 
-// ========== BULK IMPORT – UNIFIED FAST PATH (Excel + CSV) ==========
-// Why this was rewritten (v2):
-//  1. The old Excel path ran `Student.findOne()` (a DB round-trip) for EVERY
-//     row to check duplicates. For 1,000,000 rows that is 1,000,000
-//     sequential queries — this alone can take hours.
-//  2. The old Excel path then called `Student.bulkCreate(studentsToCreate)`
-//     with ALL rows in a single call. Postgres has a hard limit of 65,535
-//     bind parameters per query, so anything past ~7,000 rows blew past
-//     that limit and the whole import threw.
-//  3. Duplicate detection is pushed down to the database via
-//     `ON CONFLICT ("studentNumber") DO NOTHING` (index-backed, effectively
-//     free) instead of one SELECT per row.
-//  4. IMPORTANT (fixed in v2): batches are now inserted AS THEY ARE BUILT,
-//     with a bounded number running concurrently (a semaphore), instead of
-//     collecting every batch for the whole file before inserting any of
-//     them. The earlier version held the ENTIRE file in memory twice over
-//     (once as raw parsed rows, once as normalized batches waiting to be
-//     inserted) — for 1,000,000 rows that is enough to blow through
-//     Node's ~2GB default heap ceiling and crash the whole process, which
-//     also explains why unrelated requests (login, /fees, /settings) all
-//     failed with "Operation timeout": the batches in flight were holding
-//     every connection in the DB pool for the whole import, so nothing
-//     else could get one. This version bounds memory to roughly
-//     CONCURRENCY × BATCH_SIZE rows in flight at any moment, and never
-//     holds more than CONCURRENCY connections from the pool at once.
+// ========== BULK IMPORT – STREAMING CSV + BATCH INSERTS ==========
 router.post('/import', verifyToken, upload.single('file'), async (req, res) => {
   const startTime = Date.now();
-  let filePath = null;
-
   try {
     if (!req.file) {
       return res.status(400).json({ success: false, message: 'No file uploaded' });
     }
 
-    filePath = req.file.path;
+    const filePath = req.file.path;
     const ext = path.extname(req.file.originalname).toLowerCase();
 
-    if (ext !== '.xlsx' && ext !== '.xls' && ext !== '.csv') {
-      fs.unlinkSync(filePath);
-      filePath = null;
-      return res.status(400).json({ success: false, message: 'Only Excel (.xlsx, .xls) and CSV files are supported.' });
+    // ---------- Handle Excel files (with default class fallback) ----------
+    if (ext === '.xlsx' || ext === '.xls') {
+      try {
+        const workbook = xlsx.readFile(filePath);
+        const sheetName = workbook.SheetNames[0];
+        const worksheet = workbook.Sheets[sheetName];
+        const rows = xlsx.utils.sheet_to_json(worksheet);
+        fs.unlinkSync(filePath);
+
+        if (rows.length === 0) {
+          return res.status(400).json({ success: false, message: 'The uploaded file is empty' });
+        }
+
+        // Pre‑load class cache and default class
+        const classMap = new Map();
+        const classes = await Class.findAll({ attributes: ['id', 'className'] });
+        classes.forEach(c => classMap.set(c.className.trim(), c.id));
+        const defaultClass = await Class.findOne({ order: [['id', 'ASC']] });
+        const defaultClassId = defaultClass ? defaultClass.id : null;
+
+        const result = { total: rows.length, added: 0, skipped: 0, errors: [] };
+        const studentsToCreate = [];
+
+        for (const row of rows) {
+          const studentNumber = row['Student Number'] || row['studentNumber'] || row['student_number'] || row['StudentNumber'];
+          const fullName = row['Full Name'] || row['fullName'] || row['full_name'] || row['FullName'];
+          const gender = row['Gender'] || row['gender'];
+          const className = row['Class Name'] || row['className'] || row['class'] || row['Class'] || row['class_name'];
+          const parentName = row['Parent Name'] || row['parentName'] || row['parent_name'] || row['parent'];
+          const parentPhone = row['Parent Phone'] || row['parentPhone'] || row['parent_phone'] || row['phone'];
+          const address = row['Address'] || row['address'];
+
+          if (!studentNumber || !fullName) {
+            result.errors.push({ row, reason: 'Missing required fields: Student Number and Full Name' });
+            continue;
+          }
+
+          // Check duplicate
+          const existing = await Student.findOne({
+            where: { studentNumber: String(studentNumber).trim() }
+          });
+          if (existing) {
+            result.skipped++;
+            continue;
+          }
+
+          // ---- Handle classId ----
+          let classId = null;
+          if (className) {
+            classId = classMap.get(className.trim()) || null;
+            if (!classId) {
+              result.errors.push({ row, reason: `Class "${className}" not found. Create it first.` });
+              continue; // skip row if class not found
+            }
+          } else {
+            // No class provided – use default class if available
+            if (defaultClassId !== null) {
+              classId = defaultClassId;
+            } else {
+              result.errors.push({ row, reason: 'No class provided and no default class exists. Please create a class first.' });
+              continue;
+            }
+          }
+
+          studentsToCreate.push({
+            studentNumber: String(studentNumber).trim(),
+            fullName: String(fullName).trim(),
+            gender: gender || 'Male',
+            dateOfBirth: null,
+            classId: classId,
+            parentName: parentName ? String(parentName).trim() : null,
+            parentPhone: parentPhone ? String(parentPhone).trim() : null,
+            address: address ? String(address).trim() : null,
+            status: 'Active',
+            nationality: 'Ugandan',
+            medicalcondition: 'none'
+          });
+        }
+
+        if (studentsToCreate.length > 0) {
+          await Student.bulkCreate(studentsToCreate);
+          result.added = studentsToCreate.length;
+        }
+
+        return res.status(200).json({
+          success: true,
+          data: result,
+          message: `Import completed: ${result.added} added, ${result.skipped} skipped, ${result.errors.length} errors.`
+        });
+      } catch (error) {
+        fs.unlinkSync(filePath);
+        return res.status(500).json({ success: false, message: 'Excel processing failed: ' + error.message });
+      }
     }
 
-    // ---------- Pre-load class cache + default class (once, not per row) ----------
+    // ---------- CSV – streaming, batch insert with default class ----------
+    if (ext !== '.csv') {
+      fs.unlinkSync(filePath);
+      return res.status(400).json({ success: false, message: 'Only CSV files are supported for large imports.' });
+    }
+
+    // Pre‑load class cache and default class
     const classMap = new Map();
     const classes = await Class.findAll({ attributes: ['id', 'className'] });
-    classes.forEach(c => classMap.set(String(c.className).trim().toLowerCase(), c.id));
+    classes.forEach(c => classMap.set(c.className.trim(), c.id));
     const defaultClass = await Class.findOne({ order: [['id', 'ASC']] });
     const defaultClassId = defaultClass ? defaultClass.id : null;
 
-    const BATCH_SIZE = 20000;   // rows per multi-row INSERT statement
-    const CONCURRENCY = 2;      // max simultaneous INSERTs — leaves DB pool headroom for other requests
-    const MAX_ERRORS_STORED = 200; // don't let a bad file blow up memory/response size with 1M error rows
-
-    const result = { total: 0, added: 0, skipped: 0, errors: [] };
-    let insertedTotal = 0;
+    const BATCH_SIZE = 50000;   // rows per SQL insert
+    let totalRows = 0;
+    let inserted = 0;
+    let duplicateSkipped = 0;
+    let errors = [];
+    let batch = [];
 
     function escapeSQL(str) {
       if (str === null || str === undefined) return '';
-      return String(str).replace(/\\/g, '\\\\').replace(/'/g, "''");
+      return String(str).replace(/'/g, "''");
     }
 
-    function normalizeGender(g) {
-      const v = String(g || '').trim().toLowerCase();
-      if (v === 'f' || v === 'female') return 'Female';
-      return 'Male';
-    }
-
-    // Validate + normalize one raw row into an insertable record (or an error)
-    function resolveRow(row) {
-      const studentNumber = row['Student Number'] || row['studentNumber'] || row['student_number'] || row['StudentNumber'];
-      const fullName = row['Full Name'] || row['fullName'] || row['full_name'] || row['FullName'];
-      const gender = row['Gender'] || row['gender'];
-      const className = row['Class Name'] || row['className'] || row['class'] || row['Class'] || row['class_name'];
-      const parentName = row['Parent Name'] || row['parentName'] || row['parent_name'] || row['parent'];
-      const parentPhone = row['Parent Phone'] || row['parentPhone'] || row['parent_phone'] || row['phone'];
-      const address = row['Address'] || row['address'];
-
-      if (!studentNumber || !fullName) {
-        return { error: 'Missing required fields: Student Number and Full Name' };
-      }
-
-      let classId = null;
-      const trimmedClassName = className ? String(className).trim() : '';
-      if (trimmedClassName) {
-        classId = classMap.get(trimmedClassName.toLowerCase()) || null;
-        if (!classId) {
-          return { error: `Class "${className}" not found. Create it first.` };
-        }
-      } else if (defaultClassId !== null) {
-        classId = defaultClassId;
-      } else {
-        return { error: 'No class provided and no default class exists. Please create a class first.' };
-      }
-
-      return {
-        rec: {
-          studentNumber: String(studentNumber).trim(),
-          fullName: String(fullName).trim(),
-          gender: normalizeGender(gender),
-          classId,
-          parentName: parentName ? String(parentName).trim() : null,
-          parentPhone: parentPhone ? String(parentPhone).trim() : null,
-          address: address ? String(address).trim() : null,
-        }
-      };
-    }
-
-    // Insert one batch as a single multi-row INSERT. Duplicates (same
-    // studentNumber) are silently skipped by the database via ON CONFLICT.
-    // Wrapped so one bad batch (e.g. a constraint violation we didn't
-    // anticipate) can't take down the whole import — it's recorded as an
-    // error instead.
     async function insertBatch(rows) {
-      if (!rows || rows.length === 0) return 0;
-      const values = rows.map(r => `(
-        '${escapeSQL(r.studentNumber)}',
-        '${escapeSQL(r.fullName)}',
-        '${escapeSQL(r.gender)}',
-        ${r.classId === null ? 'NULL' : Number(r.classId)},
-        ${r.parentName ? `'${escapeSQL(r.parentName)}'` : 'NULL'},
-        ${r.parentPhone ? `'${escapeSQL(r.parentPhone)}'` : 'NULL'},
-        ${r.address ? `'${escapeSQL(r.address)}'` : 'NULL'},
-        'Active',
-        NOW(),
-        NOW()
-      )`).join(',');
+      if (rows.length === 0) return;
+      const values = rows.map(r => {
+        // r now contains classId directly
+        const classId = r.classId;
+        return `(
+          '${escapeSQL(r.studentNumber)}',
+          '${escapeSQL(r.fullName)}',
+          '${escapeSQL(r.gender || 'Male')}',
+          ${classId === null ? 'NULL' : classId},
+          ${r.parentName ? `'${escapeSQL(r.parentName)}'` : 'NULL'},
+          ${r.parentPhone ? `'${escapeSQL(r.parentPhone)}'` : 'NULL'},
+          ${r.address ? `'${escapeSQL(r.address)}'` : 'NULL'},
+          NOW(),
+          NOW()
+        )`;
+      }).join(',');
 
       const sql = `
         INSERT INTO "Students" (
           "studentNumber", "fullName", "gender", "classId",
-          "parentName", "parentPhone", "address", "status",
+          "parentName", "parentPhone", "address",
           "createdAt", "updatedAt"
         )
         VALUES ${values}
         ON CONFLICT ("studentNumber") DO NOTHING
-        RETURNING "id"
       `;
 
-      try {
-        const [insertedRows] = await sequelize.query(sql);
-        return insertedRows.length;
-      } catch (batchError) {
-        console.error('❌ Batch insert failed:', batchError.message);
-        if (result.errors.length < MAX_ERRORS_STORED) {
-          result.errors.push({ row: null, reason: `A batch of ${rows.length} rows failed: ${batchError.message}` });
-        }
-        result.skipped += rows.length;
-        return 0;
-      }
+      const result = await sequelize.query(sql);
+      const insertedCount = result[0] ? result[0].rowCount : 0;
+      inserted += insertedCount;
+      duplicateSkipped += rows.length - insertedCount;
     }
 
-    // ---------- Bounded concurrency: a tiny semaphore ----------
-    // The reading/validating loop below `await`s acquire() before handing
-    // off a new batch. Once CONCURRENCY batches are already running, the
-    // loop itself pauses — it does NOT keep building more batches in the
-    // background — which is what keeps memory bounded.
-    let activeSlots = 0;
-    const waiters = [];
-    function acquireSlot() {
-      return new Promise(resolve => {
-        if (activeSlots < CONCURRENCY) {
-          activeSlots++;
-          resolve();
-        } else {
-          waiters.push(resolve);
-        }
+    // Stream CSV
+    const fileStream = fs.createReadStream(filePath);
+    const rl = readline.createInterface({
+      input: fileStream,
+      crlfDelay: Infinity,
+    });
+
+    let isFirstLine = true;
+    let header = [];
+
+    for await (const line of rl) {
+      if (!line.trim()) continue;
+
+      if (isFirstLine) {
+        header = line.split(',').map(h => h.trim().replace(/^"|"$/g, ''));
+        isFirstLine = false;
+        continue;
+      }
+
+      const values = line.split(',').map(v => v.trim().replace(/^"|"$/g, ''));
+      const row = {};
+      header.forEach((key, index) => {
+        row[key] = values[index] || '';
       });
-    }
-    function releaseSlot() {
-      activeSlots--;
-      if (waiters.length > 0) {
-        activeSlots++;
-        waiters.shift()();
+
+      const studentNumber = row['Student Number'] || row['studentNumber'] || row['student_number'];
+      const fullName = row['Full Name'] || row['fullName'] || row['full_name'];
+
+      if (!studentNumber || !fullName) {
+        errors.push({ row, reason: 'Missing studentNumber or fullName' });
+        continue;
       }
-    }
 
-    const inFlight = []; // promises for batches currently inserting
-
-    async function submitBatch(batchRows) {
-      await acquireSlot();
-      const p = insertBatch(batchRows)
-        .then(count => { insertedTotal += count; })
-        .finally(releaseSlot);
-      inFlight.push(p);
-    }
-
-    // ---------- Collect + validate rows, submitting batches as they fill ----------
-    let pendingBatch = [];
-
-    async function pushRow(row) {
-      result.total++;
-      const { rec, error } = resolveRow(row);
-      if (error) {
-        if (result.errors.length < MAX_ERRORS_STORED) {
-          result.errors.push({ row: result.total, reason: error });
+      // ---- Handle classId ----
+      const className = (row['Class'] || row['class'] || row['className'] || '').trim();
+      let classId = null;
+      if (className) {
+        classId = classMap.get(className) || null;
+        if (!classId) {
+          errors.push({ row, reason: `Class "${className}" not found. Create it first.` });
+          continue; // skip row
         }
-        result.skipped++;
-        return;
-      }
-      pendingBatch.push(rec);
-      if (pendingBatch.length >= BATCH_SIZE) {
-        const batchToSend = pendingBatch;
-        pendingBatch = []; // detach immediately so old batch can be GC'd once inserted
-        await submitBatch(batchToSend);
-      }
-    }
-
-    if (ext === '.xlsx' || ext === '.xls') {
-      // NOTE: the 'xlsx' package parses the whole sheet into memory in one
-      // shot — there's no way around holding ~1,000,000 raw row objects
-      // briefly with this library. What we control (and what was broken
-      // before) is NOT also holding a second full copy as normalized
-      // batches. If you regularly import files this large, converting to
-      // CSV first uses the streaming line-reader below instead, which
-      // never holds the whole file in memory.
-      const workbook = xlsx.readFile(filePath, { cellDates: false });
-      const sheetName = workbook.SheetNames[0];
-      const worksheet = workbook.Sheets[sheetName];
-      const rows = xlsx.utils.sheet_to_json(worksheet, { defval: '' });
-      fs.unlinkSync(filePath);
-      filePath = null;
-
-      if (rows.length === 0) {
-        return res.status(400).json({ success: false, message: 'The uploaded file is empty' });
-      }
-      for (const row of rows) {
-        await pushRow(row);
-      }
-
-    } else {
-      // ---------- CSV – streamed line by line, never holds the whole file in memory ----------
-      const fileStream = fs.createReadStream(filePath);
-      const rl = readline.createInterface({ input: fileStream, crlfDelay: Infinity });
-
-      let isFirstLine = true;
-      let header = [];
-
-      for await (const line of rl) {
-        if (!line.trim()) continue;
-
-        if (isFirstLine) {
-          header = line.split(',').map(h => h.trim().replace(/^"|"$/g, ''));
-          isFirstLine = false;
+      } else {
+        // No class provided – use default class if available
+        if (defaultClassId !== null) {
+          classId = defaultClassId;
+        } else {
+          errors.push({ row, reason: 'No class provided and no default class exists. Please create a class first.' });
           continue;
         }
-
-        const values = line.split(',').map(v => v.trim().replace(/^"|"$/g, ''));
-        const row = {};
-        header.forEach((key, i) => { row[key] = values[i] || ''; });
-
-        await pushRow(row);
       }
 
-      fs.unlinkSync(filePath);
-      filePath = null;
+      const rec = {
+        studentNumber: studentNumber.trim(),
+        fullName: fullName.trim(),
+        gender: row['Gender'] || row['gender'] || 'Male',
+        classId: classId,  // store resolved classId
+        parentName: (row['Parent Name'] || row['parentName'] || row['parent_name'] || '').trim() || null,
+        parentPhone: (row['Parent Phone'] || row['parentPhone'] || row['parent_phone'] || '').trim() || null,
+        address: (row['Address'] || row['address'] || '').trim() || null,
+      };
+
+      batch.push(rec);
+      totalRows++;
+
+      if (batch.length >= BATCH_SIZE) {
+        await insertBatch(batch);
+        batch = [];
+      }
     }
 
-    // Flush the final partial batch and wait for every in-flight insert to finish.
-    if (pendingBatch.length > 0) {
-      await submitBatch(pendingBatch);
-      pendingBatch = [];
-    }
-    await Promise.all(inFlight);
-
-    if (result.total === 0) {
-      return res.status(400).json({ success: false, message: 'The uploaded file is empty' });
+    if (batch.length > 0) {
+      await insertBatch(batch);
     }
 
-    result.added = insertedTotal;
-
-    // Rows that passed validation but didn't get inserted were duplicates
-    // caught by ON CONFLICT DO NOTHING.
-    const validatedRows = result.total - result.skipped;
-    const duplicateSkipped = validatedRows - insertedTotal;
-    result.skipped += Math.max(duplicateSkipped, 0);
+    // Clean up file
+    fs.unlinkSync(filePath);
 
     const duration = ((Date.now() - startTime) / 1000).toFixed(1);
-    console.log(`✅ Imported ${result.added}/${result.total} students (skipped ${result.skipped}) in ${duration}s`);
+    console.log(`✅ Imported ${inserted} students (skipped ${duplicateSkipped} duplicates) in ${duration}s`);
 
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
       data: {
-        total: result.total,
-        added: result.added,
-        skipped: result.skipped,
-        errors: result.errors,
+        totalRows,
+        inserted,
+        duplicateSkipped,
+        errors: errors.slice(0, 50),
         duration: `${duration}s`
       },
-      message: `Import completed in ${duration}s: ${result.added} added, ${result.skipped} skipped, ${result.errors.length} validation errors.`
+      message: `Import completed in ${duration}s. ${inserted} added, ${duplicateSkipped} skipped.`
     });
 
   } catch (error) {
     console.error('Import error:', error);
-    if (filePath && fs.existsSync(filePath)) {
-      try { fs.unlinkSync(filePath); } catch (_) { /* ignore cleanup failure */ }
-    }
-    return res.status(500).json({ success: false, message: 'Server error: ' + error.message });
+    if (req.file && fs.existsSync(req.file.path)) fs.unlinkSync(req.file.path);
+    res.status(500).json({ success: false, message: 'Server error: ' + error.message });
   }
 });
 
