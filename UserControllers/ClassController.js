@@ -66,7 +66,7 @@ const ClassController = {
       );
 
       res.json({
-        message: 'Class deleted successfully'
+        message: 'Class deleted successfully '
       });
 
     } catch (error) {
